@@ -1,15 +1,18 @@
 use chain_core::property::{Block, HasHeader, Header, TransactionId};
-use future::Either;
-use futures::{sync::mpsc, sync::oneshot};
+
 use network_core::client::{self as core_client, block::BlockService, block::HeaderService};
 pub use protocol::protocol::ProtocolMagic;
 use protocol::{
-    network_transport::LightWeightConnectionId, protocol::GetBlockHeaders, protocol::GetBlocks,
-    Inbound, Message, Response,
+    network_transport::LightWeightConnectionId,
+    protocol::{GetBlockHeaders, GetBlocks},
+    Inbound, InboundError, InboundStream, Message, OutboundError, OutboundSink,
+    ProtocolTransactionId, Response,
 };
-use std::collections::HashMap;
-use std::marker::PhantomData;
-use std::net::SocketAddr;
+
+use futures::{sync::mpsc, sync::oneshot};
+
+use std::{collections::HashMap, error, fmt, marker::PhantomData, net::SocketAddr};
+
 use tokio::net::TcpStream;
 use tokio::prelude::*;
 
@@ -30,7 +33,7 @@ pub fn connect<B, H, I, D, Tx>(
     Error = core_client::Error,
 >
 where
-    Tx: TransactionId + cbor_event::Serialize + cbor_event::Deserialize,
+    Tx: ProtocolTransactionId,
     B: NttBlock<D, I, H>,
     H: NttHeader<D, I>,
     I: NttId,
@@ -276,13 +279,56 @@ impl<T> NttId for T where
 {
 }
 
-struct ConnectionState<B: Block + HasHeader> {
+#[derive(Debug)]
+pub enum Error {
+    Inbound(InboundError),
+    Outbound(OutboundError),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Inbound(e) => write!(f, "network input error"),
+            Error::Outbound(e) => write!(f, "network output error"),
+        }
+    }
+}
+
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Error::Inbound(e) => Some(e),
+            Error::Outbound(e) => Some(e),
+        }
+    }
+}
+
+impl From<InboundError> for Error {
+    fn from(err: InboundError) -> Self {
+        Error::Inbound(err)
+    }
+}
+
+impl From<OutboundError> for Error {
+    fn from(err: OutboundError) -> Self {
+        Error::Outbound(err)
+    }
+}
+
+pub struct Connection<T, B, Tx> {
+    inbound: Option<InboundStream<T, B, Tx>>,
+    outbound: OutboundSink<T, B, Tx>,
     requests: HashMap<LightWeightConnectionId, Request<B>>,
 }
 
-impl<B: Block + HasHeader> ConnectionState<B> {
+impl<T, B, Tx> Connection<T, B, Tx>
+where
+    T: AsyncRead + AsyncWrite,
+    B: Block + HasHeader,
+    Tx: TransactionId,
+{
     pub fn new() -> Self {
-        ConnectionState {
+        Connection {
             requests: HashMap::new(),
         }
     }
@@ -322,6 +368,168 @@ where
             V::A4(ref mut x) => x.poll(),
             V::A5(ref mut x) => x.poll(),
         }
+    }
+}
+
+impl<B: Block + HasHeader> Future for Connection<B> {
+    type Item = ();
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<(), Self::Error> {
+        while let Some(ref mut inbound) = self.inbound {
+            let mut events_processed = false;
+            match inbound.poll() {
+                Ok(Async::NotReady) => {}
+                Ok(Async::Ready(None)) => {
+                    break;
+                }
+                Ok(Async::Ready(Some(msg))) => {
+                    self.process_inbound(msg);
+                    events_processed = true;
+                }
+                Err(err) => return Err(err.into()),
+            }
+            match self.requests.poll() {
+                Ok(Async::NotReady) => {}
+                Ok(Async::Ready(Some(req))) => {
+                    self.process_request(req);
+                    events_processed = true;
+                }
+                Ok(Async::Ready(None)) => {
+                    break;
+                }
+                Err(err) => panic!("unexpected error in command queue: {:?}", err),
+            }
+            match self.outbound.poll_complete() {
+                Ok(Async::NotReady) => {}
+                Ok(Async::Ready(())) => {}
+                Err(err) => return Err(err.into()),
+            }
+            if !events_processed {
+                return Ok(Async::NotReady);
+            }
+        }
+
+        // We only get here if the inbound stream or the request queue
+        // is closed.
+        // Make sure the inbound half is dropped.
+        self.inbound.take();
+
+        // Manage shutdown of the outbound half,
+        // returning result as the result of the connection poll.
+        try_ready!(self.outbound.close())
+    }
+}
+
+fn unexpected_response_error() -> core_client::Error {
+    core_client::Error::new(core_client::ErrorKind::Rpc, "unexpected response".into())
+}
+
+fn convert_response<P, F>(
+    response: Response<P, String>,
+    conversion: F,
+) -> Result<Q, core_client::Error>
+where
+    F: FnOnce(P) -> Q,
+{
+    match response {
+        Response::Ok(x) => Ok(conversion(x)),
+        Response::Err(err) => Err(core_client::Error::new(core_client::ErrorKind::Rpc, err)),
+    }
+}
+
+impl<B: Block + HasHeader> Connection<B> {
+    fn process_inbound(&mut self, inbound: Inbound) {
+        match inbound {
+            Inbound::NothingExciting => {}
+            Inbound::BlockHeaders(lwcid, response) => {
+                let request = self.requests.remove(&lwid);
+                match request {
+                    None => {
+                        // TODO: log the bogus response
+                    }
+                    Some(Request::Tip(chan)) => {
+                        let res = convert_response(response, |p| {
+                            let header = p.0[0];
+                            (header.id(), header.date())
+                        });
+                        chan.send(res).unwrap();
+                    }
+                    Some(_) => {
+                        chan.send(Err(unexpected_response_error())).unwrap();
+                    }
+                }
+            }
+            Inbound::Block(lwcid, response) => {
+                use hash_map::Entry::*;
+
+                match self.requests.entry(lwcid) {
+                    Vacant(_) => {
+                        // TODO: log the bogus response
+                    }
+                    Occupied(entry) => match entry.get() {
+                        Request::Block(chan) => {
+                            let res = convert_response(response, |p| p);
+                            chan.send(res).unwrap();
+                        }
+                        _ => {
+                            chan.send(Err(unexpected_response_error())).unwrap();
+                        }
+                    },
+                }
+            }
+            Inbound::TransactionReceived(_lwcid, _response) => {
+                // TODO: to be implemented
+            }
+            Inbound::CloseConnection(lwcid) => {
+                match self.requests.remove(&lwcid) {
+                    None => {
+                        // TODO: log the bogus close message
+                    }
+                    Some(Request::Tip(chan)) => {
+                        chan.send(Err(core_client::Error::new(
+                            core_client::ErrorKind::Rpc,
+                            "unexpected close",
+                        )))
+                        .unwrap();
+                    }
+                    Some(Request::Block(mut chan)) => {
+                        chan.close().unwrap();
+                    }
+                    _ => (),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn process_request(&mut self, request: Request) {
+        self.outbound
+            .new_light_connection()
+            .and_then(move |(lwcid, sink)| match request {
+                Request::Tip(t) => {
+                    cc.requests.insert(lwcid, Request::Tip(t));
+                    future::Either::A({
+                        sink.send(Message::GetBlockHeaders(
+                            lwcid,
+                            GetBlockHeaders {
+                                from: vec![],
+                                to: None,
+                            },
+                        ))
+                        .and_then(|sink| future::ok((sink, cc)))
+                    })
+                }
+                Request::Block(t, from, to) => {
+                    let from1 = from.clone();
+                    let to1 = to.clone();
+                    cc.requests.insert(lwcid, Request::Block(t, from1, to1));
+                    future::Either::B({
+                        sink.send(Message::GetBlocks(lwcid, GetBlocks { from, to }))
+                            .and_then(|sink| future::ok((sink, cc)))
+                    })
+                }
+            })
     }
 }
 
